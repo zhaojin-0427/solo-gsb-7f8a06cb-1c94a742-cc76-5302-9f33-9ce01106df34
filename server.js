@@ -4,6 +4,10 @@ import { dirname, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ALLOWED_PROPS,
+  LAYER_PLAN_MAX_ELEMENTS,
+  LAYER_PLAN_MAX_LAYERS,
+  LAYER_PLAN_MAX_RULES,
+  LAYER_PLAN_MAX_TARGETS,
   LOCATOR_MAX_ANCESTORS,
   LOCATOR_MAX_ELEMENTS,
   LOCATOR_MAX_SEGMENTS,
@@ -15,6 +19,7 @@ import {
   countElements,
   findByPath,
   parseHtml,
+  planLayerOrder,
   simplifyRules,
   uniqueLocator,
 } from './src/engine.js';
@@ -243,8 +248,128 @@ async function handleLocator(req, res) {
   });
 }
 
-async function handleExamples(res) {
-  let files = [];
+async function handleLayerPlan(req, res) {
+  const body = await readJson(req);
+
+  const targets = body.targets;
+  if (!Array.isArray(targets) || targets.length < 1 || targets.length > LAYER_PLAN_MAX_TARGETS) {
+    sendJson(res, 200, {
+      ok: false,
+      message: `层顺序规划需要 1～${LAYER_PLAN_MAX_TARGETS} 项目标（当前为 `
+        + `${Array.isArray(targets) ? targets.length : 0} 项）；输入未被改动。`,
+    });
+    return;
+  }
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i] && typeof targets[i] === 'object' ? targets[i] : {};
+    if (!ALLOWED_PROPS.includes(t.property)) {
+      sendJson(res, 200, {
+        ok: false,
+        message: `第 ${i + 1} 项目标的属性必须是 ${ALLOWED_PROPS.join(' / ')} 之一；输入未被改动。`,
+      });
+      return;
+    }
+    if (t.value !== null && typeof t.value !== 'string') {
+      sendJson(res, 200, {
+        ok: false,
+        message: `第 ${i + 1} 项目标的 value 必须是声明值字符串或 null（无声明）；输入未被改动。`,
+      });
+      return;
+    }
+  }
+
+  const rules = body.rules;
+  if (!Array.isArray(rules)) {
+    sendJson(res, 200, { ok: false, message: '规则字段必须是数组，无法进行层顺序规划。' });
+    return;
+  }
+  if (rules.length > LAYER_PLAN_MAX_RULES) {
+    sendJson(res, 200, {
+      ok: false,
+      message: `层顺序规划仅支持至多 ${LAYER_PLAN_MAX_RULES} 条规则，当前有 ${rules.length} 条；规模超限，未做任何改动。`,
+    });
+    return;
+  }
+
+  const html = typeof body.html === 'string' ? body.html : '';
+  const { roots, errors: htmlErrors } = parseHtml(html);
+  const { errors: ruleErrors, layerOrder } = compileRules(rules);
+
+  const problems = [];
+  if (htmlErrors.length) problems.push('HTML 存在解析错误，请先修正');
+  if (ruleErrors.length) problems.push(`有 ${ruleErrors.length} 条规则不合法，请先修正行内报错`);
+  if (problems.length) {
+    sendJson(res, 200, {
+      ok: false,
+      htmlErrors,
+      ruleErrors,
+      layerOrder,
+      message: `${problems.join('；')}；输入未被改动。`,
+    });
+    return;
+  }
+
+  const elementCount = countElements(roots);
+  if (elementCount > LAYER_PLAN_MAX_ELEMENTS) {
+    sendJson(res, 200, {
+      ok: false,
+      htmlErrors,
+      ruleErrors,
+      layerOrder,
+      message: `层顺序规划仅支持至多 ${LAYER_PLAN_MAX_ELEMENTS} 个元素，当前 HTML 有 ${elementCount} 个元素；规模超限，未做任何改动。`,
+    });
+    return;
+  }
+
+  if (layerOrder.length > LAYER_PLAN_MAX_LAYERS) {
+    sendJson(res, 200, {
+      ok: false,
+      htmlErrors,
+      ruleErrors,
+      layerOrder,
+      message: `层顺序规划仅支持至多 ${LAYER_PLAN_MAX_LAYERS} 个命名层，当前规则包含 ${layerOrder.length} 个；规模超限，未做任何改动。`,
+    });
+    return;
+  }
+
+  for (let i = 0; i < targets.length; i++) {
+    if (!findByPath(roots, targets[i].path)) {
+      sendJson(res, 200, {
+        ok: false,
+        htmlErrors,
+        ruleErrors,
+        layerOrder,
+        message: `第 ${i + 1} 项目标的元素路径非法或不存在：${JSON.stringify(targets[i].path)}；输入未被改动。`,
+      });
+      return;
+    }
+  }
+
+  const result = planLayerOrder(roots, rules, targets);
+  const base = {
+    ok: true,
+    htmlErrors,
+    ruleErrors,
+    layerOrder,
+    elementCount,
+    ruleCount: rules.length,
+    layerCount: layerOrder.length,
+    targetCount: targets.length,
+    count: result.count,
+    totalPermutations: result.totalPermutations,
+    permutation: result.permutation,
+    permutationNumbers: result.permutationNumbers,
+    winners: result.winners,
+  };
+  if (!result.count) {
+    base.message = result.impossibleTarget >= 0
+      ? `无解：第 ${result.impossibleTarget + 1} 项目标在任何层排列下都无法满足（${result.impossibleReason}）。`
+      : '无解：各项目标的约束互相冲突，不存在同时满足全部目标的命名层排列。';
+  }
+  sendJson(res, 200, base);
+}
+
+async function handleExamples(res) {  let files = [];
   try {
     files = (await readdir(EXAMPLES_DIR)).filter((f) => f.endsWith('.json')).sort();
   } catch {
@@ -293,6 +418,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/api/analyze') return await handleAnalyze(req, res);
     if (req.method === 'POST' && pathname === '/api/simplify') return await handleSimplify(req, res);
     if (req.method === 'POST' && pathname === '/api/locator') return await handleLocator(req, res);
+    if (req.method === 'POST' && pathname === '/api/layer-plan') return await handleLayerPlan(req, res);
     if (req.method === 'GET' && pathname === '/api/examples') return await handleExamples(res);
     if (req.method === 'GET') return await serveStatic(req, res, pathname);
     sendJson(res, 405, { error: 'Method Not Allowed' });

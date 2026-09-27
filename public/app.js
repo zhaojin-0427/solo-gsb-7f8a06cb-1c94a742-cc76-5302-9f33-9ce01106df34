@@ -19,6 +19,10 @@ const simplifyModal = $('#simplifyModal');
 const simplifyModalBody = $('#simplifyModalBody');
 const simplifyCancelBtn = $('#simplifyCancelBtn');
 const simplifyConfirmBtn = $('#simplifyConfirmBtn');
+const planTargetsList = $('#planTargetsList');
+const addPlanTargetBtn = $('#addPlanTargetBtn');
+const layerPlanBtn = $('#layerPlanBtn');
+const layerPlanResult = $('#layerPlanResult');
 const toast = $('#toast');
 
 const shadow = previewHost.attachShadow({ mode: 'open' });
@@ -32,6 +36,7 @@ const PROPS = ['color', 'background-color', 'font-size'];
 const state = {
   html: '',
   rules: [],            // { uid, selector, property, value, layer, important }
+  planTargets: [],      // { uid, path, property, value, noDecl }
   selectedPath: null,
   property: 'color',
   styles: {},
@@ -362,6 +367,7 @@ async function compute() {
   }
   if (seq !== computeSeq) return; // 已有更新的请求
 
+  markPlanResultStale(); // HTML / 规则可能已变化，层顺序规划结果需重新计算
   renderHtmlErrors(data.htmlErrors);
   renderRuleErrors(data.ruleErrors || []);
   renderLayerOrder(data.layerOrder);
@@ -610,6 +616,175 @@ simplifyModal.addEventListener('click', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !simplifyModal.hidden) closeSimplifyModal();
+});
+
+/* ---------------- 层顺序规划 ---------------- */
+
+const PLAN_MAX_TARGETS = 8;
+
+function renderPlanTargets() {
+  planTargetsList.innerHTML = state.planTargets.map((t, i) => `
+  <div class="plan-target" data-uid="${t.uid}">
+    <span class="plan-target-no">目标 ${i + 1}</span>
+    <input type="text" data-field="path" placeholder="路径，如 0.1" title="元素路径（可点击预览元素后用「选中元素」按钮填入）"
+           value="${escapeHtml(t.path)}">
+    <select data-field="property">
+      ${PROPS.map((p) => `<option value="${p}"${p === t.property ? ' selected' : ''}>${p}</option>`).join('')}
+    </select>
+    <input type="text" data-field="value" placeholder="期望胜出值，如 red / 16px"
+           value="${escapeHtml(t.value)}"${t.noDecl ? ' disabled' : ''}>
+    <label class="important-label" title="要求该元素该属性没有任何匹配声明">
+      <input type="checkbox" data-field="noDecl"${t.noDecl ? ' checked' : ''}>无声明
+    </label>
+    <button type="button" class="btn-icon plan-use-selected" data-action="use-selected"
+      title="填入预览中当前选中元素的路径">选中元素</button>
+    <button type="button" class="btn-icon" data-action="delete">删除</button>
+  </div>`).join('');
+  bindPlanTargetEvents();
+  addPlanTargetBtn.disabled = state.planTargets.length >= PLAN_MAX_TARGETS;
+}
+
+function bindPlanTargetEvents() {
+  planTargetsList.querySelectorAll('.plan-target').forEach((row) => {
+    const uid = Number(row.dataset.uid);
+    const t = state.planTargets.find((x) => x.uid === uid);
+    if (!t) return;
+    const valueInput = row.querySelector('[data-field="value"]');
+    row.querySelectorAll('[data-field]').forEach((input) => {
+      const field = input.dataset.field;
+      const evt = input.tagName === 'SELECT' || input.type === 'checkbox' ? 'change' : 'input';
+      input.addEventListener(evt, () => {
+        if (field === 'noDecl') {
+          t.noDecl = input.checked;
+          valueInput.disabled = input.checked;
+        } else {
+          t[field] = input.value;
+        }
+      });
+    });
+    row.querySelector('[data-action="delete"]').addEventListener('click', () => {
+      state.planTargets = state.planTargets.filter((x) => x.uid !== uid);
+      renderPlanTargets();
+    });
+    row.querySelector('[data-action="use-selected"]').addEventListener('click', () => {
+      if (!state.selectedPath) {
+        showToast('请先在预览中点击选择一个元素');
+        return;
+      }
+      t.path = state.selectedPath;
+      row.querySelector('[data-field="path"]').value = state.selectedPath;
+    });
+  });
+}
+
+addPlanTargetBtn.addEventListener('click', () => {
+  if (state.planTargets.length >= PLAN_MAX_TARGETS) {
+    showToast(`至多 ${PLAN_MAX_TARGETS} 项目标`);
+    return;
+  }
+  // 预填当前选中元素与分析属性，减少手工输入
+  state.planTargets.push({
+    uid: uidSeq++,
+    path: state.selectedPath || '',
+    property: state.property,
+    value: '',
+    noDecl: false,
+  });
+  renderPlanTargets();
+  planTargetsList.lastElementChild.querySelector('[data-field="value"]').focus();
+});
+
+/** HTML / 规则变化后，已展示的规划结果可能过期。 */
+function markPlanResultStale() {
+  if (layerPlanResult.dataset.hasResult === '1') layerPlanResult.classList.add('stale');
+}
+
+function renderLayerPlanError(data) {
+  const htmlErrs = (data.htmlErrors || []).map((m) => `<div>${escapeHtml(m)}</div>`).join('');
+  const ruleErrs = (data.ruleErrors || [])
+    .map((e) => e.messages.map((m) => `<div>规则 #${e.index + 1}：${escapeHtml(m)}</div>`).join(''))
+    .join('');
+  layerPlanResult.dataset.hasResult = '1';
+  layerPlanResult.classList.remove('stale');
+  layerPlanResult.innerHTML = `
+    <div class="plan-error">
+      <div class="plan-error-title">无法计算层排列（HTML 与规则未被改动）</div>
+      <div class="plan-error-msg">${escapeHtml(data.message || '输入非法或超过规模上限。')}</div>
+      ${htmlErrs ? `<div class="plan-error-list"><strong>HTML 错误：</strong>${htmlErrs}</div>` : ''}
+      ${ruleErrs ? `<div class="plan-error-list"><strong>规则错误：</strong>${ruleErrs}</div>` : ''}
+    </div>`;
+}
+
+function renderLayerPlanResult(data, targets) {
+  const layerChipsHtml = data.layerOrder.length
+    ? data.layerOrder.map((l, i) => `<span class="layer-chip">#${i + 1} ${escapeHtml(l)}</span>`).join(' → ')
+    : '<span class="simp-none">无命名层（全部声明均无层）</span>';
+  layerPlanResult.dataset.hasResult = '1';
+  layerPlanResult.classList.remove('stale');
+
+  if (!data.count) {
+    layerPlanResult.innerHTML = `
+      <div class="plan-summary">命名层（按首次出现编号）：${layerChipsHtml}</div>
+      <div class="plan-none">${escapeHtml(data.message || '无解：不存在满足全部目标的层排列。')}
+        <span class="simp-note">（可行排列 0 / 全部排列 ${data.totalPermutations}）</span></div>`;
+    return;
+  }
+
+  const permChips = data.permutation.length
+    ? data.permutation.map((l, i) => `<span class="layer-chip">#${data.permutationNumbers[i]} ${escapeHtml(l)}</span>`).join(' → ')
+    : '<span class="simp-none">空排列（无命名层）</span>';
+
+  const rows = targets.map((t, i) => {
+    const w = data.winners[i];
+    const expect = t.value === null
+      ? '<span class="badge nolayer">无声明</span>'
+      : `<code>${escapeHtml(t.value)}</code>`;
+    const hit = w
+      ? `规则 #${w.ruleIndex + 1}　<code>${escapeHtml(w.selector)}</code> <span class="arrow">→</span>
+         <code>${escapeHtml(w.property)}: ${escapeHtml(w.value)}</code>
+         ${w.layer ? `<span class="badge layer">层「${escapeHtml(w.layer)}」</span>` : '<span class="badge nolayer">无层</span>'}
+         ${w.important ? '<span class="badge important">!important</span>' : ''}`
+      : '<span class="simp-none">—（无任何匹配声明，符合「无声明」目标）</span>';
+    return `<li class="plan-winner">
+      <span class="idx-chip keep">目标 ${i + 1}</span>
+      <span class="plan-winner-desc">路径 <code>${escapeHtml(t.path)}</code> · <code>${escapeHtml(t.property)}</code> · 期望 ${expect}</span>
+      <span class="arrow">⇒</span> ${hit}
+    </li>`;
+  }).join('');
+
+  layerPlanResult.innerHTML = `
+    <div class="plan-summary">命名层（按首次出现编号）：${layerChipsHtml}</div>
+    <div class="plan-count">满足全部 ${targets.length} 项目标的排列共 <strong>${data.count}</strong> 个
+      <span class="simp-note">（全部排列 ${data.totalPermutations} 个）</span></div>
+    <div class="plan-best">按层首次出现编号序列字典序最小的可行排列：${permChips}
+      <span class="simp-note">（编号序列：${data.permutationNumbers.join(' → ') || '空'}）</span></div>
+    <div class="simp-col-title plan-winners-title">该排列下各目标的胜出规则（原序号）</div>
+    <ul class="plan-winners">${rows}</ul>`;
+}
+
+layerPlanBtn.addEventListener('click', async () => {
+  if (!state.planTargets.length) {
+    showToast('请至少添加 1 项目标');
+    return;
+  }
+  const targets = state.planTargets.map((t) => ({
+    path: t.path.trim(),
+    property: t.property,
+    value: t.noDecl ? null : t.value,
+  }));
+  layerPlanBtn.disabled = true;
+  let data;
+  try {
+    data = await postJson('/api/layer-plan', { html: state.html, rules: state.rules, targets });
+  } catch (err) {
+    data = { ok: false, message: `请求失败：${err.message}` };
+  }
+  layerPlanBtn.disabled = false;
+  if (!data.ok) {
+    renderLayerPlanError(data);
+    return;
+  }
+  renderLayerPlanResult(data, targets);
 });
 
 /* ---------------- 示例 ---------------- */

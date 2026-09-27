@@ -3,6 +3,10 @@
  */
 import assert from 'node:assert/strict';
 import {
+  LAYER_PLAN_MAX_ELEMENTS,
+  LAYER_PLAN_MAX_LAYERS,
+  LAYER_PLAN_MAX_RULES,
+  LAYER_PLAN_MAX_TARGETS,
   analyzeElement,
   compileRules,
   computeAllStyles,
@@ -12,6 +16,7 @@ import {
   matchesSelector,
   parseHtml,
   parseSelector,
+  planLayerOrder,
   simplifyRules,
   uniqueLocator,
 } from '../src/engine.js';
@@ -599,6 +604,313 @@ test('唯一选择器：结果确实在整棵树上只命中目标（含 40 元�
   };
   roots.forEach(walk);
   assert.deepEqual(hits, [node]);
+});
+
+/* ---------- 层顺序规划 ---------- */
+
+function plan(html, rules, targets) {
+  const { roots, errors } = parseHtml(html);
+  assert.deepEqual(errors, []);
+  return planLayerOrder(roots, rules, targets);
+}
+
+const T = (path, property, value) => ({ path, property, value });
+
+test('层顺序规划：普通声明后层优先，统计与最优排列', () => {
+  const html = '<p class="a">x</p>';
+  const rules = [
+    R('p', 'color', 'red', { layer: 'a' }),   // 0 → 层 a 编号 1
+    R('p', 'color', 'blue', { layer: 'b' }),  // 1 → 层 b 编号 2
+  ];
+  // 目标 red：层 a 必须排在层 b 之后 → 唯一可行排列 [b, a]
+  const r = plan(html, rules, [T('0', 'color', 'red')]);
+  assert.equal(r.count, 1);
+  assert.equal(r.totalPermutations, 2);
+  assert.deepEqual(r.permutation, ['b', 'a']);
+  assert.deepEqual(r.permutationNumbers, [2, 1]);
+  assert.equal(r.winners[0].ruleIndex, 0);
+  assert.equal(r.winners[0].value, 'red');
+  // 目标 blue：层 b 在后 → 排列 [a, b]
+  const r2 = plan(html, rules, [T('0', 'color', 'blue')]);
+  assert.equal(r2.count, 1);
+  assert.deepEqual(r2.permutation, ['a', 'b']);
+  assert.equal(r2.winners[0].ruleIndex, 1);
+});
+
+test('层顺序规划：!important 先层优先', () => {
+  const html = '<p class="a">x</p>';
+  const rules = [
+    R('p', 'color', 'red', { layer: 'a', important: true }),   // 0
+    R('p.a', 'color', 'blue', { layer: 'b', important: true }), // 1 特异性更高
+  ];
+  // important 有层时先层优先：目标 blue 要求层 b 排在层 a 之前
+  const r = plan(html, rules, [T('0', 'color', 'blue')]);
+  assert.equal(r.count, 1);
+  assert.deepEqual(r.permutation, ['b', 'a']);
+  assert.equal(r.winners[0].ruleIndex, 1);
+  // 目标 red：层 a 在前
+  const r2 = plan(html, rules, [T('0', 'color', 'red')]);
+  assert.equal(r2.count, 1);
+  assert.deepEqual(r2.permutation, ['a', 'b']);
+  assert.equal(r2.winners[0].ruleIndex, 0);
+});
+
+test('层顺序规划：无层声明仍参与层叠（普通声明无层 > 有层，与排列无关）', () => {
+  const html = '<p>x</p>';
+  const rules = [
+    R('p', 'color', 'red'),                   // 0 无层
+    R('p', 'color', 'blue', { layer: 'a' }),  // 1
+  ];
+  // 无层 red 恒胜出：任何排列都满足 → 1! = 1 个排列
+  const r = plan(html, rules, [T('0', 'color', 'red')]);
+  assert.equal(r.count, 1);
+  assert.equal(r.totalPermutations, 1);
+  assert.deepEqual(r.permutation, ['a']);
+  assert.equal(r.winners[0].ruleIndex, 0);
+  // 目标 blue：固定胜者不等于目标 → 无解且是单目标不可达
+  const r2 = plan(html, rules, [T('0', 'color', 'blue')]);
+  assert.equal(r2.count, 0);
+  assert.equal(r2.permutation, null);
+  assert.equal(r2.impossibleTarget, 0);
+  assert.match(r2.impossibleReason, /与层排列无关/);
+});
+
+test('层顺序规划：!important 有层 > 无层，无层 important 仅在没有有层时胜出', () => {
+  const html = '<p>x</p>';
+  const rules = [
+    R('p', 'color', 'unlayered-imp', { important: true }),   // 0
+    R('p', 'color', 'layered-imp', { layer: 'a', important: true }), // 1
+  ];
+  // 有层 important 压制无层 important → 目标 unlayered-imp 无解
+  const r = plan(html, rules, [T('0', 'color', 'unlayered-imp')]);
+  assert.equal(r.count, 0);
+  assert.equal(r.impossibleTarget, 0);
+  const r2 = plan(html, rules, [T('0', 'color', 'layered-imp')]);
+  assert.equal(r2.count, 1);
+  assert.equal(r2.winners[0].ruleIndex, 1);
+});
+
+test('层顺序规划：无声明目标（value 为 null）', () => {
+  const html = '<div><p>x</p></div>';
+  const rules = [R('p', 'color', 'red', { layer: 'a' })];
+  // div 上 color 无任何匹配声明 → 满足
+  const r = plan(html, rules, [T('0', 'color', null)]);
+  assert.equal(r.count, 1);
+  assert.equal(r.winners[0], null);
+  // p 上有匹配声明 → 不可能无声明
+  const r2 = plan(html, rules, [T('0.0', 'color', null)]);
+  assert.equal(r2.count, 0);
+  assert.equal(r2.impossibleTarget, 0);
+  assert.match(r2.impossibleReason, /无声明/);
+  // 无匹配声明却要求具体值 → 无解
+  const r3 = plan(html, rules, [T('0', 'color', 'red')]);
+  assert.equal(r3.count, 0);
+  assert.match(r3.impossibleReason, /没有任何匹配声明/);
+});
+
+test('层顺序规划：无命名层算一个空排列', () => {
+  const html = '<p>x</p>';
+  const rules = [R('p', 'color', 'red')];
+  const r = plan(html, rules, [T('0', 'color', 'red')]);
+  assert.equal(r.count, 1);
+  assert.equal(r.totalPermutations, 1);
+  assert.deepEqual(r.permutation, []);
+  assert.deepEqual(r.permutationNumbers, []);
+  assert.equal(r.winners[0].ruleIndex, 0);
+  // 值不匹配则唯一空排列也不可行
+  const r2 = plan(html, rules, [T('0', 'color', 'blue')]);
+  assert.equal(r2.count, 0);
+});
+
+test('层顺序规划：值按字符串精确比较', () => {
+  const html = '<p>x</p>';
+  const rules = [R('p', 'color', 'red', { layer: 'a' })];
+  assert.equal(plan(html, rules, [T('0', 'color', 'RED')]).count, 0);
+  assert.equal(plan(html, rules, [T('0', 'color', ' red')]).count, 0);
+  assert.equal(plan(html, rules, [T('0', 'color', 'red ')]).count, 0);
+  assert.equal(plan(html, rules, [T('0', 'color', 'red')]).count, 1);
+});
+
+test('层顺序规划：同层内仍比较特异性与原规则顺序', () => {
+  const html = '<p class="a">x</p>';
+  const rules = [
+    R('p', 'color', 'low', { layer: 'a' }),    // 0 同层特异性低
+    R('.a', 'color', 'high', { layer: 'a' }),  // 1 同层特异性高 → 层 a 的组内冠军
+    R('p', 'color', 'other', { layer: 'b' }),  // 2
+  ];
+  // 层 a 的胜出值是 high：目标 high 要求 a 在 b 之后
+  const r = plan(html, rules, [T('0', 'color', 'high')]);
+  assert.equal(r.count, 1);
+  assert.deepEqual(r.permutation, ['b', 'a']);
+  assert.equal(r.winners[0].ruleIndex, 1);
+  // 目标 low 不可达（同层内被 .a 压制，与排列无关）
+  const r2 = plan(html, rules, [T('0', 'color', 'low')]);
+  assert.equal(r2.count, 0);
+  assert.equal(r2.impossibleTarget, 0);
+});
+
+test('层顺序规划：所有命名层均参与排列，字典序最小', () => {
+  const html = '<p class="x">x</p>';
+  const rules = [
+    R('.x', 'color', 'va', { layer: 'a' }),  // 0 → 层 a 编号 1
+    R('.x', 'color', 'vb', { layer: 'b' }),  // 1 → 层 b 编号 2
+    R('span', 'color', 'vc', { layer: 'c' }), // 2 → 层 c 编号 3（与目标无关，仍参与排列）
+  ];
+  // 目标 va：last({a,b}) = a → a 在 b 后即可，c 任意 → 3 个可行排列
+  const r = plan(html, rules, [T('0', 'color', 'va')]);
+  assert.equal(r.count, 3);
+  assert.equal(r.totalPermutations, 6);
+  // 编号序列字典序最小：[b, a, c] = [2, 1, 3]
+  assert.deepEqual(r.permutation, ['b', 'a', 'c']);
+  assert.deepEqual(r.permutationNumbers, [2, 1, 3]);
+  assert.equal(r.winners[0].ruleIndex, 0);
+});
+
+test('层顺序规划：多目标约束组合与冲突', () => {
+  const html = '<p class="a">x</p><p class="b">y</p>';
+  const rules = [
+    R('.a', 'color', 'red', { layer: 'a' }),   // 0
+    R('.a', 'color', 'blue', { layer: 'b' }),  // 1
+    R('.b', 'color', 'red', { layer: 'a' }),   // 2
+    R('.b', 'color', 'blue', { layer: 'b' }),  // 3
+  ];
+  // 两个目标同向：都要 a 在后 → 可行
+  const r = plan(html, rules, [T('0', 'color', 'red'), T('1', 'color', 'red')]);
+  assert.equal(r.count, 1);
+  assert.deepEqual(r.permutation, ['b', 'a']);
+  assert.deepEqual(r.winners.map((w) => w.ruleIndex), [0, 2]);
+  // 两个目标冲突：目标 1 要 a 在后、目标 2 要 b 在后 → 无解（各自可达但组合冲突）
+  const r2 = plan(html, rules, [T('0', 'color', 'red'), T('1', 'color', 'blue')]);
+  assert.equal(r2.count, 0);
+  assert.equal(r2.impossibleTarget, -1);
+  assert.equal(r2.winners, null);
+});
+
+test('层顺序规划：important 与普通目标混合约束', () => {
+  const html = '<p class="a">x</p><p class="b">y</p>';
+  const rules = [
+    R('.a', 'color', 'imp-a', { layer: 'a', important: true }), // 0
+    R('.a', 'color', 'imp-b', { layer: 'b', important: true }), // 1
+    R('.b', 'color', 'nor-a', { layer: 'a' }),                  // 2
+    R('.b', 'color', 'nor-b', { layer: 'b' }),                  // 3
+  ];
+  // 目标 1（important）：first({a,b}) = a；目标 2（普通）：last({a,b}) = a
+  // → a 既要最前又要最后，仅当……不可能（两层时 a 不能同时在 b 前后）→ 无解
+  const conflict = plan(html, rules, [T('0', 'color', 'imp-a'), T('1', 'color', 'nor-a')]);
+  assert.equal(conflict.count, 0);
+  // 目标 1 要 a 最前（imp-a），目标 2 要 b 最后（nor-b）→ 唯一排列 [a, b]
+  const r = plan(html, rules, [T('0', 'color', 'imp-a'), T('1', 'color', 'nor-b')]);
+  assert.equal(r.count, 1);
+  assert.deepEqual(r.permutation, ['a', 'b']);
+  assert.deepEqual(r.winners.map((w) => w.ruleIndex), [0, 3]);
+});
+
+/* 与暴力枚举全排列交叉验证（独立的层叠比较实现）。 */
+function bruteForcePlan(html, rules, targets) {
+  const { roots } = parseHtml(html);
+  const { compiled, layerOrder } = compileRules(rules);
+  const n = layerOrder.length;
+  const cmp = (a, b) => {
+    if (a.important !== b.important) return a.important ? 1 : -1;
+    const ra = a.layer === null ? Infinity : a.layerIdx;
+    const rb = b.layer === null ? Infinity : b.layerIdx;
+    if (ra !== rb) return (a.important ? ra < rb : ra > rb) ? 1 : -1;
+    for (let k = 0; k < 3; k++) {
+      if (a.specificity[k] !== b.specificity[k]) return a.specificity[k] > b.specificity[k] ? 1 : -1;
+    }
+    return a.order > b.order ? 1 : -1;
+  };
+  const okPerms = [];
+  const cur = [];
+  const used = new Array(n).fill(false);
+  const gen = () => {
+    if (cur.length === n) {
+      const rank = new Map(cur.map((li, r) => [layerOrder[li], r]));
+      const ok = targets.every((t) => {
+        const node = findByPath(roots, t.path);
+        const decls = compiled.filter((d) => d.property === t.property && matchesSelector(node, d.parsed));
+        if (!decls.length) return t.value === null;
+        if (t.value === null) return false;
+        let best = null;
+        for (const d of decls) {
+          const dd = d.layer === null ? d : { ...d, layerIdx: rank.get(d.layer) };
+          if (!best || cmp(dd, best) > 0) best = dd;
+        }
+        return best.value === t.value;
+      });
+      if (ok) okPerms.push(cur.slice());
+      return;
+    }
+    for (let i = 0; i < n; i++) {
+      if (used[i]) continue;
+      used[i] = true;
+      cur.push(i);
+      gen();
+      cur.pop();
+      used[i] = false;
+    }
+  };
+  gen();
+  return okPerms;
+}
+
+test('层顺序规划：与暴力枚举全排列结果一致（确定性伪随机用例）', () => {
+  // 简单 LCG，保证用例可复现
+  let seed = 20260927;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  const layers = ['a', 'b', 'c', 'd'];
+  const sels = ['p', '.x', 'p.x', '#m p', 'div .x'];
+  const props = ['color', 'background-color', 'font-size'];
+  const values = ['red', 'blue', 'green', '12px', '1em'];
+
+  for (let round = 0; round < 60; round++) {
+    const html = '<div id="m"><p class="x">t</p><p>u</p></div>';
+    const ruleCount = 2 + Math.floor(rnd() * 5); // 2～6 条
+    const rules = [];
+    for (let i = 0; i < ruleCount; i++) {
+      rules.push(R(pick(sels), pick(props), pick(values), {
+        layer: rnd() < 0.7 ? pick(layers) : '',
+        important: rnd() < 0.3,
+      }));
+    }
+    const targetCount = 1 + Math.floor(rnd() * 3); // 1～3 项目标
+    const targets = [];
+    for (let i = 0; i < targetCount; i++) {
+      targets.push(T(pick(['0', '0.0', '0.1']), pick(props), rnd() < 0.2 ? null : pick(values)));
+    }
+    const { roots } = parseHtml(html);
+    const got = planLayerOrder(roots, rules, targets);
+    const expected = bruteForcePlan(html, rules, targets);
+    assert.equal(got.count, expected.length, `第 ${round} 轮计数不一致：${JSON.stringify({ rules, targets })}`);
+    if (!expected.length) {
+      assert.equal(got.permutation, null);
+      continue;
+    }
+    // 字典序最小（按层首次出现编号）的可行排列
+    const bestIdx = expected.reduce((best, p) => {
+      for (let i = 0; i < p.length; i++) {
+        if (p[i] !== best[i]) return p[i] < best[i] ? p : best;
+      }
+      return best;
+    });
+    const { layerOrder } = compileRules(rules);
+    assert.deepEqual(got.permutation, bestIdx.map((i) => layerOrder[i]),
+      `第 ${round} 轮最优排列不一致：${JSON.stringify({ rules, targets })}`);
+    assert.deepEqual(got.permutationNumbers, bestIdx.map((i) => i + 1));
+    // 各目标胜出规则确实满足目标
+    targets.forEach((t, i) => {
+      if (t.value === null) assert.equal(got.winners[i], null);
+      else assert.equal(got.winners[i].value, t.value);
+    });
+  }
+});
+
+test('层顺序规划：规模上限常量', () => {
+  assert.equal(LAYER_PLAN_MAX_ELEMENTS, 40);
+  assert.equal(LAYER_PLAN_MAX_RULES, 60);
+  assert.equal(LAYER_PLAN_MAX_LAYERS, 12);
+  assert.equal(LAYER_PLAN_MAX_TARGETS, 8);
 });
 
 console.log(`\n全部 ${passed} 项测试通过。`);

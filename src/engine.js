@@ -723,6 +723,238 @@ export function simplifyRules(roots, rules) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 层顺序规划                                                           */
+/* ------------------------------------------------------------------ */
+
+/** 层顺序规划允许的最大元素数、规则数、命名层数与目标数。 */
+export const LAYER_PLAN_MAX_ELEMENTS = 40;
+export const LAYER_PLAN_MAX_RULES = 60;
+export const LAYER_PLAN_MAX_LAYERS = 12;
+export const LAYER_PLAN_MAX_TARGETS = 8;
+
+function factorial(n) {
+  let f = 1;
+  for (let i = 2; i <= n; i++) f *= i;
+  return f;
+}
+
+/** 同重要级、同层（或同无层）声明中的胜出者：依次比较特异性与规则顺序。 */
+function championOf(decls) {
+  let best = decls[0];
+  for (let i = 1; i < decls.length; i++) {
+    if (compareDecl(decls[i], best) > 0) best = decls[i];
+  }
+  return best;
+}
+
+/**
+ * 由单个目标的匹配声明推导层排列约束（值按字符串精确比较）。
+ * 返回：
+ *  - { ok: true, constraint: null }：与层排列无关，恒成立；
+ *  - { ok: true, constraint: { type, layers, good } }：
+ *      type 'first'：layers 中在排列里最靠前的层必须属于 good（!important 先层优先）；
+ *      type 'last' ：layers 中在排列里最靠后的层必须属于 good（普通声明后层优先）；
+ *  - { ok: false, reason }：任何层排列都无法满足该目标。
+ */
+function targetConstraint(decls, value) {
+  if (!decls.length) {
+    return value === null
+      ? { ok: true, constraint: null }
+      : { ok: false, reason: '该元素在该属性上没有任何匹配声明，任何排列下都不会有胜出值' };
+  }
+  if (value === null) {
+    return { ok: false, reason: '该元素在该属性上存在匹配声明，任何排列下都有胜出值，不可能"无声明"' };
+  }
+  const important = decls.filter((d) => d.important);
+  const group = important.length ? important : decls;
+  const layered = group.filter((d) => d.layer !== null);
+  const unlayered = group.filter((d) => d.layer === null);
+
+  // 与层排列无关的固定胜出者：普通声明无层 > 有层；
+  // !important 有层 > 无层（故无层 important 仅在没有任何有层 important 时胜出）。
+  const fixed = important.length
+    ? (layered.length ? null : unlayered)
+    : (unlayered.length ? unlayered : null);
+  if (fixed) {
+    const champ = championOf(fixed);
+    return champ.value === value
+      ? { ok: true, constraint: null }
+      : { ok: false, reason: `该目标的胜出声明与层排列无关（胜出值 "${champ.value}"），不等于目标值 "${value}"` };
+  }
+
+  // 胜出者必为某一层的组内冠军：!important 取排列中最靠前的层，普通声明取最靠后的层
+  const byLayer = new Map();
+  for (const d of layered) {
+    if (!byLayer.has(d.layer)) byLayer.set(d.layer, []);
+    byLayer.get(d.layer).push(d);
+  }
+  const good = [];
+  for (const [layer, ds] of byLayer) {
+    if (championOf(ds).value === value) good.push(layer);
+  }
+  if (!good.length) {
+    return { ok: false, reason: `任何命名层的组内胜出值都不等于目标值 "${value}"` };
+  }
+  return {
+    ok: true,
+    constraint: { type: important.length ? 'first' : 'last', layers: [...byLayer.keys()], good },
+  };
+}
+
+/**
+ * 层顺序规划：只调整命名层的先后（规则内容与顺序固定，无层声明仍参与层叠），
+ * 统计使全部目标成立的层排列总数，并给出按层首次出现编号序列字典序最小的可行排列。
+ *
+ * 每个目标被精确归约为一条关于层排列的约束（见 targetConstraint），
+ * 因此用子集 DP（2^n，n ≤ LAYER_PLAN_MAX_LAYERS）即可精确计数，无需枚举 n! 个排列：
+ * 逐层放置时，"first" 约束在集合 S 首个成员落位时判定，"last" 约束在 S 末个成员落位时判定，
+ * 判定只依赖已放置的层集合，与放置顺序无关。
+ *
+ * 调用方须先保证 HTML 无解析错误、规则全部合法、目标路径均可解析、规模未超限。
+ *
+ * targets：[{ path, property, value }]，value 为声明值字符串，null 表示"无声明"。
+ * 返回 {
+ *   layerOrder,            // 原层顺序（按层名首次出现）
+ *   count,                 // 满足全部目标的排列总数
+ *   totalPermutations,     // 命名层全排列数（无命名层时为 1：一个空排列）
+ *   permutation,           // 编号序列字典序最小的可行排列（层名数组）；无解为 null
+ *   permutationNumbers,    // 该排列对应的层首次出现编号（1 起）；无解为 null
+ *   winners,               // 该排列下各目标的胜出声明（无声明目标为 null）；无解为 null
+ *   impossibleTarget,      // 任何排列都无法满足的目标下标（0 基）；无此类目标为 -1
+ *   impossibleReason,      // 该目标不可满足的原因
+ * }
+ */
+export function planLayerOrder(roots, rules, targets) {
+  const { compiled, layerOrder } = compileRules(rules);
+  const n = layerOrder.length;
+  const layerIndex = new Map(layerOrder.map((l, i) => [l, i]));
+  const totalPermutations = factorial(n);
+
+  const perTargetDecls = [];
+  const constraints = [];
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i];
+    const node = findByPath(roots, t.path);
+    const decls = node
+      ? compiled.filter((d) => d.property === t.property && matchesSelector(node, d.parsed))
+      : [];
+    perTargetDecls.push(decls);
+    const r = targetConstraint(decls, t.value);
+    if (!r.ok) {
+      return {
+        layerOrder,
+        count: 0,
+        totalPermutations,
+        permutation: null,
+        permutationNumbers: null,
+        winners: null,
+        impossibleTarget: i,
+        impossibleReason: r.reason,
+      };
+    }
+    if (r.constraint) {
+      const toMask = (names) => names.reduce((m, name) => m | (1 << layerIndex.get(name)), 0);
+      constraints.push({
+        type: r.constraint.type,
+        S: toMask(r.constraint.layers),
+        G: toMask(r.constraint.good),
+      });
+    }
+  }
+
+  // 放置第 x 层（已放置集合为 mask）时，检查所有因此落位而判定的约束
+  const canPlace = (mask, x) => {
+    const bit = 1 << x;
+    for (const c of constraints) {
+      if (!(c.S & bit)) continue;
+      if (c.type === 'first') {
+        // x 是 S 中第一个落位的层 → 它必须属于 good
+        if ((mask & c.S) === 0 && !(c.G & bit)) return false;
+      } else if (((c.S & ~bit) & ~mask) === 0 && !(c.G & bit)) {
+        // S 中其余层均已落位 → x 是 S 中最后落位的层，必须属于 good
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // g[mask]：在已放置集合 mask 之后，合法放置剩余层的方案数
+  const full = (1 << n) - 1;
+  const memo = new Array(1 << n).fill(-1);
+  const completions = (mask) => {
+    if (mask === full) return 1;
+    if (memo[mask] !== -1) return memo[mask];
+    let total = 0;
+    for (let x = 0; x < n; x++) {
+      if ((mask & (1 << x)) || !canPlace(mask, x)) continue;
+      total += completions(mask | (1 << x));
+    }
+    memo[mask] = total;
+    return total;
+  };
+
+  const count = completions(0);
+  if (!count) {
+    return {
+      layerOrder,
+      count: 0,
+      totalPermutations,
+      permutation: null,
+      permutationNumbers: null,
+      winners: null,
+      impossibleTarget: -1,
+      impossibleReason: null,
+    };
+  }
+
+  // 编号序列字典序最小的可行排列：逐位取仍能完成合法排列的最小编号
+  const permIdx = [];
+  let mask = 0;
+  while (permIdx.length < n) {
+    for (let x = 0; x < n; x++) {
+      if ((mask & (1 << x)) || !canPlace(mask, x)) continue;
+      if (completions(mask | (1 << x)) > 0) {
+        permIdx.push(x);
+        mask |= 1 << x;
+        break;
+      }
+    }
+  }
+  const permutation = permIdx.map((i) => layerOrder[i]);
+  const permutationNumbers = permIdx.map((i) => i + 1);
+
+  // 该排列下各目标的胜出声明：重映射层名次后按同一套层叠规则比较
+  const rank = new Map(permIdx.map((li, r) => [layerOrder[li], r]));
+  const winners = perTargetDecls.map((decls) => {
+    if (!decls.length) return null;
+    let best = null;
+    for (const d of decls) {
+      const dd = d.layer === null ? d : { ...d, layerIdx: rank.get(d.layer) };
+      if (!best || compareDecl(dd, best) > 0) best = dd;
+    }
+    return {
+      ruleIndex: best.index,
+      selector: best.selector,
+      property: best.property,
+      value: best.value,
+      layer: best.layer,
+      important: best.important,
+    };
+  });
+
+  return {
+    layerOrder,
+    count,
+    totalPermutations,
+    permutation,
+    permutationNumbers,
+    winners,
+    impossibleTarget: -1,
+    impossibleReason: null,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* 唯一选择器                                                           */
 /* ------------------------------------------------------------------ */
 
