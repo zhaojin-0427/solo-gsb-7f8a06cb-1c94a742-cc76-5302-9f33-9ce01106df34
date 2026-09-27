@@ -7,6 +7,10 @@ import {
   LOCATOR_MAX_ANCESTORS,
   LOCATOR_MAX_ELEMENTS,
   LOCATOR_MAX_SEGMENTS,
+  PLAN_MAX_ELEMENTS,
+  PLAN_MAX_LAYERS,
+  PLAN_MAX_RULES,
+  PLAN_MAX_TARGETS,
   SIMPLIFY_MAX_ELEMENTS,
   SIMPLIFY_MAX_RULES,
   analyzeElement,
@@ -15,6 +19,7 @@ import {
   countElements,
   findByPath,
   parseHtml,
+  planLayerOrder,
   simplifyRules,
   uniqueLocator,
 } from './src/engine.js';
@@ -243,6 +248,134 @@ async function handleLocator(req, res) {
   });
 }
 
+async function handleLayerPlan(req, res) {
+  const body = await readJson(req);
+  const rules = Array.isArray(body.rules) ? body.rules : null;
+
+  if (!rules) {
+    sendJson(res, 200, { ok: false, message: '规则字段必须是数组，无法进行层顺序规划。' });
+    return;
+  }
+  if (rules.length > PLAN_MAX_RULES) {
+    sendJson(res, 200, {
+      ok: false,
+      message: `层顺序规划仅支持至多 ${PLAN_MAX_RULES} 条规则，当前有 ${rules.length} 条；规模超限。`,
+    });
+    return;
+  }
+
+  const targets = Array.isArray(body.targets) ? body.targets : null;
+  if (!targets || targets.length < 1 || targets.length > PLAN_MAX_TARGETS) {
+    sendJson(res, 200, {
+      ok: false,
+      message: `层顺序规划需要 1～${PLAN_MAX_TARGETS} 项目标，当前为 ${targets ? targets.length : 0} 项。`,
+    });
+    return;
+  }
+
+  const html = typeof body.html === 'string' ? body.html : '';
+  const { roots, errors: htmlErrors } = parseHtml(html);
+  const { compiled, errors: ruleErrors, layerOrder } = compileRules(rules);
+
+  const problems = [];
+  if (htmlErrors.length) problems.push('HTML 存在解析错误，请先修正后再规划');
+  if (ruleErrors.length) problems.push(`有 ${ruleErrors.length} 条规则不合法，请先修正行内报错后再规划`);
+  if (problems.length) {
+    sendJson(res, 200, {
+      ok: false,
+      htmlErrors,
+      ruleErrors,
+      layerOrder,
+      message: `${problems.join('；')}；输入未被改动。`,
+    });
+    return;
+  }
+
+  const elementCount = countElements(roots);
+  if (elementCount > PLAN_MAX_ELEMENTS) {
+    sendJson(res, 200, {
+      ok: false,
+      htmlErrors,
+      ruleErrors,
+      layerOrder,
+      elementCount,
+      message: `层顺序规划仅支持至多 ${PLAN_MAX_ELEMENTS} 个元素，当前 HTML 有 ${elementCount} 个元素；规模超限。`,
+    });
+    return;
+  }
+  if (layerOrder.length > PLAN_MAX_LAYERS) {
+    sendJson(res, 200, {
+      ok: false,
+      htmlErrors,
+      ruleErrors,
+      layerOrder,
+      elementCount,
+      message: `层顺序规划仅支持至多 ${PLAN_MAX_LAYERS} 个命名层，当前规则中有 ${layerOrder.length} 个；规模超限。`,
+    });
+    return;
+  }
+
+  // 校验并解析目标：路径必须指向存在的元素，属性限三项，value 为非空字符串或 null（无声明）
+  const resolved = [];
+  const targetErrors = [];
+  targets.forEach((t, i) => {
+    const label = `目标 #${i + 1}`;
+    if (!t || typeof t !== 'object' || Array.isArray(t)) {
+      targetErrors.push(`${label}：必须是 { path, property, value } 对象`);
+      return;
+    }
+    if (!ALLOWED_PROPS.includes(t.property)) {
+      targetErrors.push(`${label}：属性必须是 ${ALLOWED_PROPS.join(' / ')} 之一`);
+      return;
+    }
+    let value = t.value;
+    if (value === null || value === undefined) {
+      value = null;
+    } else if (typeof value === 'string') {
+      value = value.trim();
+      if (!value) {
+        targetErrors.push(`${label}：目标值不能为空字符串（无声明请使用 null）`);
+        return;
+      }
+    } else {
+      targetErrors.push(`${label}：目标值必须是字符串或 null（null 表示无声明）`);
+      return;
+    }
+    const node = findByPath(roots, t.path);
+    if (!node) {
+      targetErrors.push(`${label}：路径 ${JSON.stringify(t.path)} 非法或元素不存在`);
+      return;
+    }
+    resolved.push({ node, property: t.property, value });
+  });
+  if (targetErrors.length) {
+    sendJson(res, 200, {
+      ok: false,
+      htmlErrors,
+      ruleErrors,
+      layerOrder,
+      elementCount,
+      targetErrors,
+      message: `目标输入非法：${targetErrors.join('；')}`,
+    });
+    return;
+  }
+
+  const result = planLayerOrder(compiled, layerOrder, resolved);
+  sendJson(res, 200, {
+    ok: true,
+    htmlErrors,
+    ruleErrors,
+    layerOrder,
+    elementCount,
+    ruleCount: rules.length,
+    total: result.total,
+    best: result.best,
+    winners: result.winners,
+    message: result.total ? null : '没有满足全部目标的层排列（可行排列总数为 0）。',
+  });
+}
+
 async function handleExamples(res) {
   let files = [];
   try {
@@ -293,6 +426,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/api/analyze') return await handleAnalyze(req, res);
     if (req.method === 'POST' && pathname === '/api/simplify') return await handleSimplify(req, res);
     if (req.method === 'POST' && pathname === '/api/locator') return await handleLocator(req, res);
+    if (req.method === 'POST' && pathname === '/api/layer-plan') return await handleLayerPlan(req, res);
     if (req.method === 'GET' && pathname === '/api/examples') return await handleExamples(res);
     if (req.method === 'GET') return await serveStatic(req, res, pathname);
     sendJson(res, 405, { error: 'Method Not Allowed' });

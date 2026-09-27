@@ -19,6 +19,10 @@ const simplifyModal = $('#simplifyModal');
 const simplifyModalBody = $('#simplifyModalBody');
 const simplifyCancelBtn = $('#simplifyCancelBtn');
 const simplifyConfirmBtn = $('#simplifyConfirmBtn');
+const targetsList = $('#targetsList');
+const addTargetBtn = $('#addTargetBtn');
+const planBtn = $('#planBtn');
+const planResult = $('#planResult');
 const toast = $('#toast');
 
 const shadow = previewHost.attachShadow({ mode: 'open' });
@@ -366,6 +370,7 @@ async function compute() {
   renderRuleErrors(data.ruleErrors || []);
   renderLayerOrder(data.layerOrder);
   state.styles = data.styles || {};
+  resetPlanResult(); // HTML / 规则已变化，旧的规划结果不再适用
 
   const htmlOk = !(data.htmlErrors && data.htmlErrors.length);
   if (htmlOk && state.html !== state.lastRenderedHtml) {
@@ -612,6 +617,178 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !simplifyModal.hidden) closeSimplifyModal();
 });
 
+/* ---------------- 层顺序规划 ---------------- */
+
+const PLAN_MAX_TARGETS = 8; // 与服务端 PLAN_MAX_TARGETS 保持一致
+const PLAN_EMPTY_TIP = '<p class="empty-tip">添加目标并点击「计算层排列」后，此处展示可行排列总数、最优层排列与各目标的胜出规则。</p>';
+
+let targetUidSeq = 1;
+const planTargets = []; // { uid, path, property, value, noDecl }
+
+function targetRowHtml(t, idx) {
+  return `
+  <div class="target-card" data-uid="${t.uid}">
+    <div class="target-title">
+      <span>目标 #${idx + 1}</span>
+      <button type="button" class="btn-icon target-use-selected" data-action="use-selected"
+        title="将路径填为预览中当前选中的元素">用选中元素</button>
+    </div>
+    <div class="target-grid">
+      <input type="text" data-field="path" placeholder="元素路径，如 0.1"
+             value="${escapeHtml(t.path)}">
+      <select data-field="property">
+        ${PROPS.map((p) => `<option value="${p}"${p === t.property ? ' selected' : ''}>${p}</option>`).join('')}
+      </select>
+      <input type="text" data-field="value" placeholder="目标值，如 red / 16px"
+             value="${escapeHtml(t.value)}"${t.noDecl ? ' disabled' : ''}>
+      <label class="nodecl-label">
+        <input type="checkbox" data-field="noDecl"${t.noDecl ? ' checked' : ''}>无声明
+      </label>
+      <button type="button" class="btn-icon" data-action="delete">删除</button>
+    </div>
+  </div>`;
+}
+
+function renderTargets() {
+  targetsList.innerHTML = planTargets.map((t, i) => targetRowHtml(t, i)).join('');
+  bindTargetEvents();
+}
+
+function bindTargetEvents() {
+  targetsList.querySelectorAll('.target-card').forEach((card) => {
+    const uid = Number(card.dataset.uid);
+    const t = planTargets.find((x) => x.uid === uid);
+    if (!t) return;
+    card.querySelectorAll('[data-field]').forEach((input) => {
+      const field = input.dataset.field;
+      const evt = input.tagName === 'SELECT' || input.type === 'checkbox' ? 'change' : 'input';
+      input.addEventListener(evt, () => {
+        t[field] = input.type === 'checkbox' ? input.checked : input.value;
+        if (field === 'noDecl') {
+          card.querySelector('[data-field="value"]').disabled = input.checked;
+        }
+      });
+    });
+    card.querySelector('[data-action="delete"]').addEventListener('click', () => {
+      const i = planTargets.findIndex((x) => x.uid === uid);
+      if (i !== -1) planTargets.splice(i, 1);
+      renderTargets();
+    });
+    card.querySelector('[data-action="use-selected"]').addEventListener('click', () => {
+      if (!state.selectedPath) {
+        showToast('请先在预览中点击选择一个元素');
+        return;
+      }
+      t.path = state.selectedPath;
+      renderTargets();
+    });
+  });
+}
+
+function addTarget(partial = {}) {
+  planTargets.push({
+    uid: targetUidSeq++,
+    path: '',
+    property: 'color',
+    value: '',
+    noDecl: false,
+    ...partial,
+  });
+}
+
+function resetPlanResult() {
+  planResult.innerHTML = PLAN_EMPTY_TIP;
+}
+
+function renderPlanError(data) {
+  const htmlErrors = (data.htmlErrors || []).map((m) => `<div>${escapeHtml(m)}</div>`).join('');
+  const ruleErrors = (data.ruleErrors || [])
+    .map((e) => e.messages.map((m) => `<div>规则 #${e.index + 1}：${escapeHtml(m)}</div>`).join(''))
+    .join('');
+  planResult.innerHTML = `
+    <div class="simp-error-title">无法进行层顺序规划（输入未被改动）</div>
+    <div class="simp-error-msg">${escapeHtml(data.message || '输入不合法或超过规模上限。')}</div>
+    ${htmlErrors ? `<div class="simp-error-list"><strong>HTML 错误：</strong>${htmlErrors}</div>` : ''}
+    ${ruleErrors ? `<div class="simp-error-list"><strong>规则错误：</strong>${ruleErrors}</div>` : ''}`;
+}
+
+function renderPlanResult(data) {
+  if (!data.total) {
+    planResult.innerHTML = `
+      <div class="plan-summary plan-summary-zero">
+        可行排列总数：<strong>0</strong>　${escapeHtml(data.message || '没有满足全部目标的层排列。')}
+      </div>`;
+    return;
+  }
+  const bestChips = data.best.length
+    ? data.best.map((l) => `<span class="layer-chip">${escapeHtml(l)}</span>`).join(' → ')
+    : '<span class="simp-none">（空排列：规则中没有命名层）</span>';
+  const rows = planTargets.map((t, i) => {
+    const expect = t.noDecl
+      ? '<span class="badge nolayer">无声明</span>'
+      : `<code>${escapeHtml(t.property)}: ${escapeHtml(t.value)}</code>`;
+    let winDesc;
+    const w = data.winners[i];
+    if (w == null) {
+      winDesc = '<span class="badge nolayer">无胜出规则</span>';
+    } else {
+      const r = state.rules[w];
+      winDesc = `<span class="badge win">胜出</span> 规则 #${w + 1}`
+        + (r ? ` <code>${escapeHtml(r.selector)}</code> <span class="arrow">→</span>
+          <code>${escapeHtml(r.property)}: ${escapeHtml(r.value)}</code>` : '');
+    }
+    return `<li class="plan-target-row">
+      <span class="idx-chip keep">#${i + 1}</span>
+      <code>${escapeHtml(t.path)}</code> ${expect} <span class="arrow">→</span> ${winDesc}
+    </li>`;
+  }).join('');
+  planResult.innerHTML = `
+    <div class="plan-summary">可行排列总数：<strong>${data.total}</strong></div>
+    <div class="simp-layers">
+      <div><span class="simp-col-title">原层顺序（首次出现）：</span>${layerChips(data.layerOrder)}</div>
+      <div><span class="simp-col-title">字典序最小可行排列：</span>${bestChips}</div>
+    </div>
+    <div class="simp-col-title plan-winners-title">各目标胜出规则（按上述排列，序号为原规则序号）</div>
+    <ul class="plan-target-list">${rows}</ul>`;
+}
+
+planBtn.addEventListener('click', async () => {
+  if (!planTargets.length) {
+    renderPlanError({ message: '请至少添加 1 项目标。' });
+    return;
+  }
+  const targets = planTargets.map((t) => ({
+    path: t.path.trim(),
+    property: t.property,
+    value: t.noDecl ? null : t.value,
+  }));
+  planBtn.disabled = true;
+  let data;
+  try {
+    data = await postJson('/api/layer-plan', { html: state.html, rules: state.rules, targets });
+  } catch (err) {
+    planBtn.disabled = false;
+    renderPlanError({ message: `请求失败：${err.message}` });
+    return;
+  }
+  planBtn.disabled = false;
+  if (!data.ok) {
+    renderPlanError(data);
+    return;
+  }
+  renderPlanResult(data);
+});
+
+addTargetBtn.addEventListener('click', () => {
+  if (planTargets.length >= PLAN_MAX_TARGETS) {
+    showToast(`至多 ${PLAN_MAX_TARGETS} 项目标`);
+    return;
+  }
+  addTarget();
+  renderTargets();
+  targetsList.lastElementChild?.querySelector('[data-field="path"]')?.focus();
+});
+
 /* ---------------- 示例 ---------------- */
 
 function loadExample(ex) {
@@ -668,6 +845,8 @@ async function init() {
     opt.example = ex;
     exampleSelect.append(opt);
   });
+  addTarget();
+  renderTargets();
   loadExample(examples[0]);
 }
 

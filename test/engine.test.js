@@ -12,6 +12,7 @@ import {
   matchesSelector,
   parseHtml,
   parseSelector,
+  planLayerOrder,
   simplifyRules,
   uniqueLocator,
 } from '../src/engine.js';
@@ -599,6 +600,204 @@ test('唯一选择器：结果确实在整棵树上只命中目标（含 40 元�
   };
   roots.forEach(walk);
   assert.deepEqual(hits, [node]);
+});
+
+/* ---------- 层顺序规划 ---------- */
+
+function plan(html, rules, rawTargets) {
+  const { roots, errors } = parseHtml(html);
+  assert.deepEqual(errors, []);
+  const { compiled, errors: ruleErrors, layerOrder } = compileRules(rules);
+  assert.deepEqual(ruleErrors, []);
+  const targets = rawTargets.map((t) => ({
+    node: findByPath(roots, t.path),
+    property: t.property,
+    value: t.value,
+  }));
+  return planLayerOrder(compiled, layerOrder, targets);
+}
+
+test('层顺序规划：普通声明后层优先，唯一可行排列', () => {
+  const html = '<p></p>';
+  const rules = [
+    R('p', 'color', 'red', { layer: 'a' }),   // 0
+    R('p', 'color', 'green', { layer: 'b' }), // 1
+  ];
+  // green 胜出 ⇔ b 在 a 之后
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'green' }]);
+  assert.deepEqual(r.layerOrder, ['a', 'b']);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.best, ['a', 'b']);
+  assert.deepEqual(r.winners, [1]);
+  // red 胜出 ⇔ a 在 b 之后
+  const r2 = plan(html, rules, [{ path: '0', property: 'color', value: 'red' }]);
+  assert.equal(r2.total, 1);
+  assert.deepEqual(r2.best, ['b', 'a']);
+  assert.deepEqual(r2.winners, [0]);
+});
+
+test('层顺序规划：目标值无人能提供时总数为 0', () => {
+  const html = '<p></p>';
+  const rules = [R('p', 'color', 'red', { layer: 'a' })];
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'blue' }]);
+  assert.equal(r.total, 0);
+  assert.equal(r.best, null);
+  assert.equal(r.winners, null);
+});
+
+test('层顺序规划：null 目标要求无任何匹配声明', () => {
+  const html = '<p></p>';
+  const rules = [R('p', 'color', 'red', { layer: 'a' }), R('p', 'font-size', '16px')];
+  // font-size 有匹配声明 → 不可行
+  assert.equal(plan(html, rules, [{ path: '0', property: 'font-size', value: null }]).total, 0);
+  // background-color 无匹配声明 → 可行；排列数 = 1! = 1
+  const r = plan(html, rules, [{ path: '0', property: 'background-color', value: null }]);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.best, ['a']);
+  assert.deepEqual(r.winners, [null]);
+});
+
+test('层顺序规划：important 先层优先（特异性更高也要让位）', () => {
+  const html = '<p class="a"></p>';
+  const rules = [
+    R('p', 'color', 'x', { layer: 'a', important: true }),   // 0
+    R('p.a', 'color', 'y', { layer: 'b', important: true }), // 1 特异性更高但 important 先层优先
+  ];
+  // y 胜出 ⇔ b 在 a 之前
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'y' }]);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.best, ['b', 'a']);
+  assert.deepEqual(r.winners, [1]);
+});
+
+test('层顺序规划：无层声明照常参与层叠（普通无层 / important 无层均固定胜出）', () => {
+  const html = '<p></p>';
+  const rules = [
+    R('p', 'color', 'u'),                               // 0 无层普通
+    R('p', 'color', 'a-val', { layer: 'a' }),           // 1
+    R('p', 'font-size', 'imp-u', { important: true }),  // 2 无层 important
+  ];
+  // 普通：无层 u 固定胜出，与层排列无关 → 唯一排列 [a]
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'u' }]);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.best, ['a']);
+  assert.deepEqual(r.winners, [0]);
+  // 目标为 a-val → 无解（无层普通恒压有层普通）
+  assert.equal(plan(html, rules, [{ path: '0', property: 'color', value: 'a-val' }]).total, 0);
+  // important：无层 important 固定胜出（无有层 important 竞争时）
+  const r2 = plan(html, rules, [{ path: '0', property: 'font-size', value: 'imp-u' }]);
+  assert.equal(r2.total, 1);
+  assert.deepEqual(r2.winners, [2]);
+});
+
+test('层顺序规划：important 有层 > 无层', () => {
+  const html = '<p></p>';
+  const rules = [
+    R('p', 'color', 'u', { important: true }),             // 0 无层 important
+    R('p', 'color', 'v', { layer: 'a', important: true }), // 1 有层 important
+  ];
+  // 有层 important 恒胜无层 important → v 必胜
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'v' }]);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.winners, [1]);
+  assert.equal(plan(html, rules, [{ path: '0', property: 'color', value: 'u' }]).total, 0);
+});
+
+test('层顺序规划：无命名层时算一个空排列', () => {
+  const html = '<p></p>';
+  const rules = [R('p', 'color', 'red')];
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'red' }]);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.best, []);
+  assert.deepEqual(r.winners, [0]);
+  assert.equal(plan(html, rules, [{ path: '0', property: 'color', value: 'blue' }]).total, 0);
+});
+
+test('层顺序规划：多目标约束合并计数', () => {
+  const html = '<p class="x"></p><span></span>';
+  const rules = [
+    R('p', 'color', 'pa', { layer: 'a' }),                        // 0
+    R('p', 'color', 'pb', { layer: 'b' }),                        // 1
+    R('span', 'font-size', 'sa', { layer: 'a', important: true }), // 2
+    R('span', 'font-size', 'sc', { layer: 'c', important: true }), // 3
+  ];
+  // 层顺序 [a, b, c]。目标1：p.color = pa ⇔ a 在 b 后；目标2：span.font-size = sa ⇔ a 在 c 前
+  // 枚举 6 种排列，仅 [b, a, c] 同时满足
+  const r = plan(html, rules, [
+    { path: '0', property: 'color', value: 'pa' },
+    { path: '1', property: 'font-size', value: 'sa' },
+  ]);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.best, ['b', 'a', 'c']);
+  assert.deepEqual(r.winners, [0, 2]);
+});
+
+test('层顺序规划：统计全部可行排列，字典序最小者未必是原层顺序', () => {
+  const html = '<p></p>';
+  const rules = [
+    R('p', 'color', 'va', { layer: 'a', important: true }),
+    R('p', 'color', 'vb', { layer: 'b', important: true }),
+    R('p', 'font-size', 'fc', { layer: 'c' }),
+  ];
+  // 层 [a, b, c]；目标 color=vb ⇔ b 在 a 前 → 可行排列 bac / bca / cba 共 3 种；
+  // 编号序列 [1,0,2] [1,2,0] [2,1,0]，字典序最小为 [1,0,2] = [b, a, c]
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'vb' }]);
+  assert.equal(r.total, 3);
+  assert.deepEqual(r.best, ['b', 'a', 'c']);
+  assert.deepEqual(r.winners, [1]);
+});
+
+test('层顺序规划：同层内仍比较特异性与原规则顺序', () => {
+  const html = '<p class="x"></p>';
+  const rules = [
+    R('p', 'color', 'low', { layer: 'a' }),   // 0 同层特异性低
+    R('.x', 'color', 'high', { layer: 'a' }), // 1 同层特异性高 → 层 a 的代表值
+    R('p', 'color', 'other', { layer: 'b' }), // 2
+  ];
+  // 层 a 的代表是 high（特异性高）；目标 high ⇔ a 在 b 后
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'high' }]);
+  assert.equal(r.total, 1);
+  assert.deepEqual(r.best, ['b', 'a']);
+  assert.deepEqual(r.winners, [1]);
+  // 目标 low 无解：层 a 内 low 永远输给 high
+  assert.equal(plan(html, rules, [{ path: '0', property: 'color', value: 'low' }]).total, 0);
+});
+
+test('层顺序规划：恒真目标不约束排列，全部排列可行且取首次出现顺序', () => {
+  const html = '<p></p>';
+  const rules = [
+    R('p', 'color', 'red', { layer: 'a' }),
+    R('p', 'color', 'red', { layer: 'b' }),
+    R('p', 'color', 'red', { layer: 'c' }),
+  ];
+  // 三个层都能给出 red → 3! = 6 种排列全部可行；字典序最小即首次出现顺序
+  const r = plan(html, rules, [{ path: '0', property: 'color', value: 'red' }]);
+  assert.equal(r.total, 6);
+  assert.deepEqual(r.best, ['a', 'b', 'c']);
+  // [a, b, c] 下普通声明后层优先 → c 层的规则 2 胜出
+  assert.deepEqual(r.winners, [2]);
+});
+
+test('层顺序规划：排列总数按阶乘统计（未参与目标的层也参与排列）', () => {
+  const html = '<p></p>';
+  const rules = [
+    R('p', 'color', 'v1', { layer: 'a' }),
+    R('p', 'color', 'v2', { layer: 'b' }),
+    R('p', 'color', 'v3', { layer: 'c' }),
+    R('p', 'color', 'v4', { layer: 'd' }),
+  ];
+  // 无 background-color 声明的 null 目标恒真 → 4! = 24
+  const r = plan(html, rules, [{ path: '0', property: 'background-color', value: null }]);
+  assert.equal(r.total, 24);
+  assert.deepEqual(r.best, ['a', 'b', 'c', 'd']);
+  assert.deepEqual(r.winners, [null]);
+});
+
+test('层顺序规划：值按字符串精确比较（red ≠ #f00）', () => {
+  const html = '<p></p>';
+  const rules = [R('p', 'color', 'red')];
+  assert.equal(plan(html, rules, [{ path: '0', property: 'color', value: '#f00' }]).total, 0);
+  assert.equal(plan(html, rules, [{ path: '0', property: 'color', value: 'red' }]).total, 1);
 });
 
 console.log(`\n全部 ${passed} 项测试通过。`);

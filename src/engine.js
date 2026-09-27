@@ -723,6 +723,158 @@ export function simplifyRules(roots, rules) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 层顺序规划                                                           */
+/* ------------------------------------------------------------------ */
+
+/** 层顺序规划允许的最大元素数、规则数、命名层数与目标数。 */
+export const PLAN_MAX_ELEMENTS = 40;
+export const PLAN_MAX_RULES = 60;
+export const PLAN_MAX_LAYERS = 12;
+export const PLAN_MAX_TARGETS = 8;
+
+/**
+ * 层顺序规划：只重排命名层的先后（规则内容与顺序固定，无层声明照常参与层叠），
+ * 统计有多少种层排列能让全部目标成立，并给出按"层首次出现编号"字典序最小的可行排列。
+ *
+ * 目标：{ node, property, value }；value 为声明值字符串（与胜出值精确比较），
+ * null 表示该元素该属性不得有任何匹配声明。
+ *
+ * 关键观察：对某个目标，胜出者只通过"相关层集合中的最前 / 最后者"依赖层排列——
+ *  - 有 !important 匹配时仅 !important 竞争：存在有层 !important 时，
+ *    排名最前的有层 !important 所在层内的最优声明胜出（important 先层优先）；
+ *    否则胜者固定为最优无层 !important 声明（与排列无关）。
+ *  - 否则普通声明竞争：存在无层声明时胜者固定（无层 > 有层，与排列无关）；
+ *    否则排名最后的有层声明所在层内的最优声明胜出（普通声明后层优先）。
+ * 同层（同重要级）内部只比较特异性与规则顺序，与层排列无关。
+ * 因此每个目标转化为"层集合 S 的最前 / 最后元素必须落在 W ⊆ S 内"的约束，
+ * 用子集 DP 统计满足全部约束的排列数，并按编号字典序贪心重建最小排列。
+ *
+ * 调用方须先保证 HTML 无解析错误、规则全部合法、规模未超限，
+ * 且 layerOrder.length ≤ PLAN_MAX_LAYERS（位掩码按 32 位整数计算）。
+ *
+ * 返回 { layerOrder, total, best, winners }：
+ *  - layerOrder：原层顺序（按首次出现）；
+ *  - total：满足全部目标的排列总数（无命名层时算 1 个空排列）；
+ *  - best：编号序列字典序最小的可行排列（层名数组）；total 为 0 时为 null；
+ *  - winners：各目标在 best 下的胜出规则原序号（0 基），无声明目标为 null；total 为 0 时为 null。
+ */
+export function planLayerOrder(compiled, layerOrder, targets) {
+  const k = layerOrder.length;
+
+  // 同层（或同无层）且同重要级内的最优声明：只比较特异性与规则顺序，与层排列无关
+  const bestWithin = (decls) => decls.reduce((a, b) => (compareDecl(a, b) >= 0 ? a : b));
+
+  const minCons = []; // important：集合中排名最前的层决定胜者
+  const maxCons = []; // 普通声明：集合中排名最后的层决定胜者
+  let impossible = false;
+
+  // 把"层集合 S 的最前 / 最后元素必须落在 W 内"记录为位掩码约束（W 为该层最优声明值等于目标值的层）
+  const pushConstraint = (decls, value, out) => {
+    const byLayer = new Map(); // layerIdx -> 该层参与竞争的声明
+    for (const d of decls) {
+      const arr = byLayer.get(d.layerIdx);
+      if (arr) arr.push(d); else byLayer.set(d.layerIdx, [d]);
+    }
+    let mask = 0;
+    let goodMask = 0;
+    for (const [idx, arr] of byLayer) {
+      mask |= 1 << idx;
+      if (bestWithin(arr).value === value) goodMask |= 1 << idx;
+    }
+    if (!goodMask) impossible = true; // 没有任何层的代表值等于目标值
+    out.push({ mask, goodMask });
+  };
+
+  for (const t of targets) {
+    const matched = compiled.filter((d) => d.property === t.property && matchesSelector(t.node, d.parsed));
+    if (t.value === null) {
+      // 无声明目标：存在任何匹配声明即不可能（与排列无关）
+      if (matched.length) impossible = true;
+      continue;
+    }
+    if (!matched.length) { impossible = true; continue; }
+
+    const imp = matched.filter((d) => d.important);
+    if (imp.length) {
+      const layered = imp.filter((d) => d.layer !== null);
+      if (layered.length) {
+        pushConstraint(layered, t.value, minCons);
+      } else if (bestWithin(imp).value !== t.value) {
+        impossible = true; // 胜者固定为最优无层 !important 声明
+      }
+    } else {
+      const unlayered = matched.filter((d) => d.layer === null);
+      if (unlayered.length) {
+        if (bestWithin(unlayered).value !== t.value) impossible = true; // 胜者固定为最优无层普通声明
+      } else {
+        pushConstraint(matched, t.value, maxCons);
+      }
+    }
+  }
+
+  if (impossible) return { layerOrder, total: 0, best: null, winners: null };
+
+  const fullMask = (1 << k) - 1;
+  const memo = new Array(1 << k).fill(-1);
+
+  // 在 placed 之后放置层 x 是否合法：
+  //  - min 约束：x 是 S 中第一个被放置的层时，x 必须在 W 内；
+  //  - max 约束：放置 x 后 S 全部放置完毕（x 是 S 中最后一个）时，x 必须在 W 内。
+  const placeOk = (placed, x) => {
+    const bit = 1 << x;
+    for (const c of minCons) {
+      if ((c.mask & bit) && !(c.mask & placed) && !(c.goodMask & bit)) return false;
+    }
+    for (const c of maxCons) {
+      if ((c.mask & bit) && !(c.mask & ~placed & ~bit) && !(c.goodMask & bit)) return false;
+    }
+    return true;
+  };
+
+  const count = (placed) => {
+    if (placed === fullMask) return 1;
+    const cached = memo[placed];
+    if (cached !== -1) return cached;
+    let total = 0;
+    for (let x = 0; x < k; x++) {
+      const bit = 1 << x;
+      if (!(placed & bit) && placeOk(placed, x)) total += count(placed | bit);
+    }
+    memo[placed] = total;
+    return total;
+  };
+
+  const total = count(0);
+  if (!total) return { layerOrder, total: 0, best: null, winners: null };
+
+  // 贪心重建编号序列字典序最小的可行排列：每位取仍有可行完成的最小编号
+  const bestIdx = [];
+  let placed = 0;
+  for (let pos = 0; pos < k; pos++) {
+    for (let x = 0; x < k; x++) {
+      const bit = 1 << x;
+      if ((placed & bit) || !placeOk(placed, x) || !count(placed | bit)) continue;
+      bestIdx.push(x);
+      placed |= bit;
+      break;
+    }
+  }
+  const best = bestIdx.map((i) => layerOrder[i]);
+
+  // 在 best 排列下重映射层排名后复用 compareDecl，取各目标的胜出规则原序号
+  const rankOf = new Map(bestIdx.map((layerIdx, pos) => [layerIdx, pos]));
+  const permCompiled = compiled.map((d) => (
+    d.layer === null ? d : { ...d, layerIdx: rankOf.get(d.layerIdx) }
+  ));
+  const winners = targets.map((t) => {
+    if (t.value === null) return null;
+    return analyzeElement(t.node, t.property, permCompiled)[0]?.ruleIndex ?? null;
+  });
+
+  return { layerOrder, total, best, winners };
+}
+
+/* ------------------------------------------------------------------ */
 /* 唯一选择器                                                           */
 /* ------------------------------------------------------------------ */
 

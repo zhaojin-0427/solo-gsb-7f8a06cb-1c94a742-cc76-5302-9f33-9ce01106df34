@@ -51,6 +51,7 @@
           <li>层顺序按层名首次出现的位置确定。</li>
           <li>同层（同重要级）：依次比较 ID 数、类数、类型数，再比较规则顺序（靠后者优先）。</li>
           <li>“等价精简”会穷举原序规则子序列，并对每个候选重新计算层名首次出现顺序与层叠结果，找出使全部元素三属性胜出值（含无声明）不变的最短保留集；确认后才会替换规则。</li>
+          <li>“层顺序规划”（页面底部）只重排命名层先后：统计让全部目标成立的层排列总数，给出按层首次出现编号字典序最小的可行排列与各目标胜出规则原序号。</li>
         </ul>
       </details>
     </section>
@@ -76,6 +77,24 @@
       <div id="layerOrderInfo" class="layer-order"></div>
       <div id="analysis" class="analysis">
         <p class="empty-tip">点击左侧预览中的元素后，此处展示匹配声明、胜出值与落败原因。</p>
+      </div>
+    </section>
+
+    <!-- 层顺序规划 -->
+    <section class="panel plan-panel">
+      <h2>层顺序规划</h2>
+      <p class="hint">
+        保持规则内容与顺序不变，只调整命名层的先后顺序（无层声明照常参与层叠），统计能让全部目标成立的层排列总数，
+        并给出按层首次出现编号字典序最小的可行排列与各目标胜出规则。目标值按字符串精确比较；勾选「无声明」表示该元素该属性不得有任何匹配声明。
+        限 40 个元素 / 60 条规则 / 12 个命名层 / 1～8 项目标；本面板不改动 HTML 与规则。
+      </p>
+      <div id="targetsList" class="targets-list"></div>
+      <div class="plan-actions">
+        <button id="addTargetBtn" type="button" class="btn-secondary">+ 添加目标</button>
+        <button id="planBtn" type="button">计算层排列</button>
+      </div>
+      <div id="planResult" class="plan-result">
+        <p class="empty-tip">添加目标并点击「计算层排列」后，此处展示可行排列总数、最优层排列与各目标的胜出规则。</p>
       </div>
     </section>
   </main>
